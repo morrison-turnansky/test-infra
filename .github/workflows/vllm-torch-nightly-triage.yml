@@ -161,18 +161,22 @@ jobs:
             --allowedTools "Read,Glob,Grep,Write"
           prompt: |
             Read .claude/skills/vllm-pytorch-ci-triage/SKILL.md and apply its
-            root-cause analysis guidance -- in particular "Group by root cause", the
-            "Gotchas observed" list, and the repo routing cheat-sheet.
+            root-cause analysis guidance -- in particular "Identify and group root
+            causes", the "Gotchas the parser does not catch" list, and the repo
+            routing cheat-sheet.
 
             Inputs, all under ${{ runner.temp }}/triage:
               - report.md   the torch-nightly vs baseline A/B, with clusters
               - report.json the same data structured
               - cluster-logs/<safe-cluster-name>.log  one representative Buildkite
-                context artifact per nightly-only cluster, with bounded failure
-                windows followed by a cleaned raw tail. The first lines of each file
-                give the cluster name, job name, job URL, state and exit status.
-              - cluster-logs/both_*.log  the existing pytest A/B diff for each surfaced `both`
-                cluster. These are red-on-both-twins clusters (see report.json
+                context artifact per nightly-only cluster, with
+                capture_mode: nightly_failure_context, bounded failure windows,
+                and a cleaned raw tail. It intentionally has no pytest failure list;
+                the first lines give the cluster name, job name, job URL, state and
+                exit status.
+              - cluster-logs/both_*.log  the existing pytest A/B diff
+                (capture_mode: both_pytest_diff) for each surfaced `both` cluster.
+                These are red-on-both-twins clusters (see report.json
                 "regressed_tests"): the job fails on both the torch-nightly and
                 baseline build, but fails MORE tests on nightly. A "shared failure(s)"
                 section pairs each shared failure's torch_nightly_exception_chain and
@@ -185,10 +189,14 @@ jobs:
                 clusters. These files are evidence only; a window is not proof that
                 it belongs to the unique nightly pytest failure.
 
-            For each cluster, identify the actual failure: the failed test IDs and the
-            real exception. Remember that "Engine core initialization failed. See root
-            cause above." is never the root cause -- scan upward for the exception the
-            worker logged. Then group clusters that share one underlying cause, and for
+            For nightly-only clusters, identify the real terminal exception from the
+            bounded failure windows and raw tail; these files intentionally do not
+            contain pytest test IDs. For surfaced `both` clusters, use the pytest
+            diff and report.json regressed_tests for the nightly-only test IDs, then
+            use the paired side contexts as evidence. Remember that "Engine core
+            initialization failed. See root cause above." and "Server exited
+            unexpectedly" are wrappers, never root causes when the child exception is
+            available. Then group clusters that share one underlying cause, and for
             each cause say whether it belongs in pytorch/pytorch or vllm-project/vllm
             per the cheat-sheet, with your confidence and reasoning.
 
@@ -199,7 +207,7 @@ jobs:
 
             Write your findings as markdown to ${{ runner.temp }}/findings.md. Be
             explicit about uncertainty; a cluster whose cause you cannot determine from
-            the log tail should be listed as undetermined rather than guessed at.
+            the supplied artifacts should be listed as undetermined rather than guessed at.
 
             Also write ${{ runner.temp }}/findings.json with exactly this shape, so a
             later step can file issues from it without re-reading your prose:
