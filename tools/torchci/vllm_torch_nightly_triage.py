@@ -34,14 +34,17 @@ import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from torchci.clickhouse import get_clickhouse_client
 from torchci.vllm_log_parser import (
+    FailureContextConfig,
     FailedTest,
+    clean_failure_context_lines,
+    extract_failure_context,
     get_test_signature,
     parse_log,
-    strip_markers,
 )
 
 
@@ -530,15 +533,111 @@ def _render_shared_section(shared_failures: List[Tuple[FailedTest, FailedTest]])
     return "\n".join(sections)
 
 
-def _artifact_header(cluster_key: str, representative: Dict) -> str:
+def _artifact_header(cluster_key: str, representative: Dict, side: str = "") -> str:
     """Render the metadata shared by all cluster-log artifacts."""
-    header = (
+    side_header = f"# side: {side}\n" if side else ""
+    return (
         f"# cluster: {cluster_key}\n"
         f"# job: {representative['name']}\n"
         f"# url: {representative['url']}\n"
-        f"# state: {representative['state']} exit_status: {representative['exit_status']}\n"
+        f"# state: {representative['state']} exit_status: "
+        f"{representative.get('exit_status', 'unknown')}\n" + side_header
     )
-    return header
+
+
+def _render_raw_tail_fallback(body: str, tail_lines: int) -> tuple[str, int, int]:
+    """Return a bounded cleaned tail for context-extraction failures."""
+    cleaned_lines = clean_failure_context_lines(body)
+    bounded_tail_lines = max(0, tail_lines)
+    shown_lines = min(bounded_tail_lines, len(cleaned_lines))
+    tail = "\n".join(cleaned_lines[-shown_lines:]) if shown_lines else ""
+    return tail, shown_lines, len(cleaned_lines)
+
+
+def render_failure_context(
+    body: str,
+    cluster_key: str,
+    representative: Dict,
+    side: str,
+    tail_lines: int,
+    max_failure_window_instances_per_type: int = 3,
+    failure_window_context_before_lines: int = 12,
+    failure_window_context_after_lines: int = 80,
+    capture_mode: str = "failure_context",
+) -> str:
+    """Render bounded windows followed by the configured raw tail.
+
+    Context extraction is diagnostic only. If it fails, retain a bounded tail and
+    record the error instead of allowing it to affect A/B bucketing or pytest diffs.
+    """
+    try:
+        context = extract_failure_context(
+            body,
+            FailureContextConfig(
+                max_failure_window_instances_per_type=(
+                    max_failure_window_instances_per_type
+                ),
+                raw_tail_line_count=tail_lines,
+                failure_window_context_before_lines=(
+                    failure_window_context_before_lines
+                ),
+                failure_window_context_after_lines=failure_window_context_after_lines,
+            ),
+        )
+    except Exception as exc:
+        tail, shown_lines, total_lines = _render_raw_tail_fallback(body, tail_lines)
+        error = f"{type(exc).__name__}: {str(exc).replace(chr(10), ' ')}"
+        return (
+            _artifact_header(cluster_key, representative, side)
+            + f"# capture_mode: {capture_mode}\n"
+            + f"# failure_context_error: {error}\n"
+            + f"# raw_tail: last {shown_lines} of {total_lines} lines\n\n"
+            + tail
+        )
+
+    sections = [
+        _artifact_header(cluster_key, representative, side),
+        f"# capture_mode: {capture_mode}\n",
+        f"# cleaned_log_lines: {context['line_count']}\n",
+        "# failure_window_counts:",
+    ]
+    for summary in context["failure_windows"]:
+        sections.append(
+            f"#   {summary['window_type']}: matched={summary['matched_instance_count']} "
+            f"emitted={summary['emitted_instance_count']} "
+            f"truncated={summary['instances_truncated']}"
+        )
+    sections.append("")
+
+    # Instances are serialized in chronological order. The per-type counts above
+    # retain observability without grouping the displayed windows by type.
+    for instance_number, instance in enumerate(
+        context["windows_in_chronological_order"], start=1
+    ):
+        sections.append(
+            f"## failure_window {instance_number}: {instance['window_type']} "
+            f"(lines {instance['start_line']}-{instance['end_line']}, "
+            f"anchor {instance['anchor_line']})"
+        )
+        if instance["process"]:
+            sections.append(f"# process: {instance['process']}")
+        if instance["nearest_marker"]:
+            sections.append(f"# nearest_marker: {instance['nearest_marker']}")
+        sections.append("")
+        sections.append(instance["text"])
+        sections.append("")
+
+    raw_tail = context["raw_tail"]
+    sections.extend(
+        [
+            "## raw_tail",
+            f"# lines {raw_tail['start_line']}-{raw_tail['end_line']} "
+            f"({raw_tail['line_count']} lines)",
+            "",
+            raw_tail["text"],
+        ]
+    )
+    return "\n".join(sections)
 
 
 def render_nightly_failure_tail(
@@ -546,23 +645,26 @@ def render_nightly_failure_tail(
     cluster_key: str,
     representative: Dict,
     tail_lines: int,
+    max_failure_window_instances_per_type: int = 3,
+    failure_window_context_before_lines: int = 12,
+    failure_window_context_after_lines: int = 80,
 ) -> str:
-    """Serialize a nightly-only cluster as cleaned raw failure context.
+    """Serialize a nightly-only cluster as bounded raw failure context.
 
     This path deliberately does not parse pytest output. A job in the regressed
     bucket is already known to have passed on baseline, so its artifact is raw
     context for root-cause analysis rather than a pytest failure report.
     """
-    cleaned_lines = strip_markers(body).splitlines()
-    shown_lines = min(tail_lines, len(cleaned_lines))
-    capture_notes = (
-        "# capture_mode: nightly_failure_context\n"
-        f"# raw_tail: last {shown_lines} of {len(cleaned_lines)} lines\n\n"
-    )
-    return (
-        _artifact_header(cluster_key, representative)
-        + capture_notes
-        + "\n".join(cleaned_lines[-tail_lines:])
+    return render_failure_context(
+        body,
+        cluster_key,
+        representative,
+        side="",
+        tail_lines=tail_lines,
+        max_failure_window_instances_per_type=(max_failure_window_instances_per_type),
+        failure_window_context_before_lines=failure_window_context_before_lines,
+        failure_window_context_after_lines=failure_window_context_after_lines,
+        capture_mode="nightly_failure_context",
     )
 
 
@@ -667,12 +769,14 @@ class BothClusterDiff:
         rep: Representative job for the cluster.
         torch_nightly_body: Fetched nightly log retained for callers that need it.
         diff: The failing-test diff; new_failures is non-empty.
+        baseline_body: Fetched baseline log retained for side-context rendering.
     """
 
     cluster: str
     rep: Dict
     torch_nightly_body: str
     diff: DiffResult
+    baseline_body: str = ""
 
 
 def _fetch_both_clusters(
@@ -743,23 +847,45 @@ def diff_both_clusters(
             continue
         if not diff.new_failures:
             continue
-        surfaced.append(BothClusterDiff(cluster, rep, torch_nightly_body, diff))
+        surfaced.append(
+            BothClusterDiff(
+                cluster,
+                rep,
+                torch_nightly_body,
+                diff,
+                baseline_body,
+            )
+        )
     return surfaced
 
 
 def _write_both_artifacts(
-    cluster_diffs: List[BothClusterDiff], pathlib_dir: Any
+    cluster_diffs: List[BothClusterDiff],
+    pathlib_dir: Any,
+    tail_lines: int,
+    max_failure_window_instances_per_type: int = 3,
+    failure_window_context_before_lines: int = 12,
+    failure_window_context_after_lines: int = 80,
 ) -> List[str]:
-    """Write one `both_*.log` artifact per surfaced cluster.
+    """Write the pytest diff and two bounded side-context files per cluster.
 
     Args:
         cluster_diffs: Surfaced both-cluster diffs.
         pathlib_dir: Directory to write artifacts into.
+        tail_lines: Lines of raw tail kept in each side-context file.
 
     Returns:
         Paths of the artifacts written.
     """
     written: List[str] = []
+    # `pathlib_dir` is the cluster-logs/ directory. Keep both-side context in a
+    # sibling directory so the workflow can upload and download it independently.
+    both_context_dir = (
+        pathlib_dir.parent / "both-cluster-logs" if cluster_diffs else None
+    )
+    if both_context_dir is not None:
+        both_context_dir.mkdir(parents=True, exist_ok=True)
+
     for cluster_diff in cluster_diffs:
         artifact = render_both_pytest_diff(
             cluster_diff.cluster,
@@ -771,6 +897,48 @@ def _write_both_artifacts(
         with open(dest, "w") as f:
             f.write(artifact)
         written.append(str(dest))
+
+        nightly_context = render_failure_context(
+            cluster_diff.torch_nightly_body,
+            cluster_diff.cluster,
+            cluster_diff.rep,
+            side="nightly",
+            tail_lines=tail_lines,
+            max_failure_window_instances_per_type=(
+                max_failure_window_instances_per_type
+            ),
+            failure_window_context_before_lines=failure_window_context_before_lines,
+            failure_window_context_after_lines=failure_window_context_after_lines,
+            capture_mode="both_failure_context",
+        )
+        nightly_dest = both_context_dir / f"nightly_{safe}.log"
+        with open(nightly_dest, "w") as f:
+            f.write(nightly_context)
+        written.append(str(nightly_dest))
+
+        baseline_representative = {
+            "name": cluster_diff.rep["name"],
+            "url": cluster_diff.rep.get("baseline_url", ""),
+            "state": cluster_diff.rep.get("baseline_state", "unknown"),
+            "exit_status": "unknown",
+        }
+        baseline_context = render_failure_context(
+            cluster_diff.baseline_body,
+            cluster_diff.cluster,
+            baseline_representative,
+            side="baseline",
+            tail_lines=tail_lines,
+            max_failure_window_instances_per_type=(
+                max_failure_window_instances_per_type
+            ),
+            failure_window_context_before_lines=failure_window_context_before_lines,
+            failure_window_context_after_lines=failure_window_context_after_lines,
+            capture_mode="both_failure_context",
+        )
+        baseline_dest = both_context_dir / f"baseline_{safe}.log"
+        with open(baseline_dest, "w") as f:
+            f.write(baseline_context)
+        written.append(str(baseline_dest))
     return written
 
 
@@ -781,12 +949,16 @@ def fetch_cluster_logs(
     tail_lines: int,
     torch_versions: Optional[List[str]] = None,
     regressed_tests: Optional[List[Dict]] = None,
+    max_failure_window_instances_per_type: int = 3,
+    failure_window_context_before_lines: int = 12,
+    failure_window_context_after_lines: int = 80,
 ) -> List[str]:
     """Download one representative artifact per surfaced cluster.
 
-    Nightly-only clusters get a cleaned raw tail. Surfaced `both` clusters get their
-    already-computed pytest A/B diff. There is one artifact per cluster rather than
-    one per job because a cluster is most likely a single root cause.
+    Nightly-only clusters get bounded failure windows followed by a cleaned raw tail.
+    Surfaced `both` clusters get their already-computed pytest A/B diff plus one
+    bounded raw-context file for each side. There is one artifact set per cluster
+    rather than one per job because a cluster is most likely a single root cause.
 
     Args:
         buckets: The compare() buckets.
@@ -797,6 +969,9 @@ def fetch_cluster_logs(
             appended here.
         regressed_tests: Optional output list; when provided, the `both`-bucket
             clusters are diffed and surfaced entries are appended here.
+        max_failure_window_instances_per_type: Maximum emitted windows per type.
+        failure_window_context_before_lines: Lines before each window anchor.
+        failure_window_context_after_lines: Lines after each window anchor.
 
     Returns:
         Paths of the artifacts written.
@@ -805,7 +980,7 @@ def fetch_cluster_logs(
     for job in buckets["regressed"]:
         clusters[cluster_key(job["name"])].append(job)
 
-    pathlib_dir = __import__("pathlib").Path(logs_dir)
+    pathlib_dir = Path(logs_dir)
     pathlib_dir.mkdir(parents=True, exist_ok=True)
     written: List[str] = []
 
@@ -831,7 +1006,15 @@ def fetch_cluster_logs(
             if found:
                 torch_versions.append(found.group(1))
 
-        artifact = render_nightly_failure_tail(body, key, rep, tail_lines)
+        artifact = render_nightly_failure_tail(
+            body,
+            key,
+            rep,
+            tail_lines,
+            max_failure_window_instances_per_type,
+            failure_window_context_before_lines,
+            failure_window_context_after_lines,
+        )
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", key)[:80]
         dest = pathlib_dir / f"{safe}.log"
         with open(dest, "w") as f:
@@ -843,7 +1026,16 @@ def fetch_cluster_logs(
         regressed_tests.extend(
             _build_regressed_entry(cd.cluster, cd.rep, cd.diff) for cd in cluster_diffs
         )
-        written.extend(_write_both_artifacts(cluster_diffs, pathlib_dir))
+        written.extend(
+            _write_both_artifacts(
+                cluster_diffs,
+                pathlib_dir,
+                tail_lines,
+                max_failure_window_instances_per_type,
+                failure_window_context_before_lines,
+                failure_window_context_after_lines,
+            )
+        )
 
     return written
 
@@ -862,7 +1054,30 @@ def main() -> int:
         help="fetch one representative Buildkite log per cluster into this directory "
         "(requires BUILDKITE_TOKEN)",
     )
-    parser.add_argument("--log-tail-lines", type=int, default=400)
+    parser.add_argument(
+        "--log-tail-lines",
+        type=int,
+        default=400,
+        help="number of cleaned Buildkite log lines retained at the end of each context",
+    )
+    parser.add_argument(
+        "--max-failure-window-instances-per-type",
+        type=int,
+        default=3,
+        help="maximum failure windows emitted for each window type",
+    )
+    parser.add_argument(
+        "--failure-window-context-before-lines",
+        type=int,
+        default=12,
+        help="cleaned log lines included before each failure-window anchor",
+    )
+    parser.add_argument(
+        "--failure-window-context-after-lines",
+        type=int,
+        default=80,
+        help="cleaned log lines included after each failure-window anchor",
+    )
     args = parser.parse_args()
 
     client = get_clickhouse_client()
@@ -906,6 +1121,9 @@ def main() -> int:
                 args.log_tail_lines,
                 torch_versions,
                 regressed_tests,
+                args.max_failure_window_instances_per_type,
+                args.failure_window_context_before_lines,
+                args.failure_window_context_after_lines,
             )
             print(f"fetched {len(written)} cluster log(s)", file=sys.stderr)
 

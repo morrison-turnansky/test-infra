@@ -9,6 +9,7 @@ far from the end of a huge log is still captured.
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -44,6 +45,28 @@ class ParsedLog:
     pytest_results: list[PytestResult] = field(default_factory=list)
     error_excerpt: str = ""
     job_is_infra: bool = False
+
+
+@dataclass(frozen=True)
+class FailureContextConfig:
+    """Bounds and context sizes used by :func:`extract_failure_context`."""
+
+    max_failure_window_instances_per_type: int = 3
+    raw_tail_line_count: int = 400
+    failure_window_context_before_lines: int = 12
+    failure_window_context_after_lines: int = 80
+
+    def __post_init__(self) -> None:
+        if self.max_failure_window_instances_per_type < 1:
+            raise ValueError(
+                "max_failure_window_instances_per_type must be at least one"
+            )
+        if self.raw_tail_line_count < 0:
+            raise ValueError("raw_tail_line_count must not be negative")
+        if self.failure_window_context_before_lines < 0:
+            raise ValueError("failure_window_context_before_lines must not be negative")
+        if self.failure_window_context_after_lines < 0:
+            raise ValueError("failure_window_context_after_lines must not be negative")
 
 
 TIMESTAMP_RE = re.compile(r"^\[[\d\-T:Z]+\]\s*")
@@ -82,6 +105,87 @@ INFRA_PATTERNS = [
 ]
 
 
+FAILURE_WINDOW_TYPES = (
+    "engine_core_failure",
+    "worker_failure",
+    "api_server_failure",
+    "python_traceback",
+    "signal_or_process_exit",
+    "cuda_nccl_or_oom",
+    "import_or_linker_failure",
+    "command_failure",
+)
+
+# These patterns classify anchor lines in precedence order. A line belongs to at
+# most one type, so a CUDA exception inside an EngineCore traceback is represented
+# by the EngineCore occurrence rather than creating a second anchor on that line.
+_FAILURE_ANCHOR_PATTERNS = {
+    "engine_core_failure": re.compile(
+        r"(?:EngineCore\s+failed\s+to\s+start|"
+        r"Engine\s+core\s+initialization\s+failed|"
+        r"Process\s+EngineCore\b|"
+        r"\(EngineCore\s+pid=\d+\).*"
+        r"(?:Traceback|\b(?:ERROR|CRITICAL)\b|\b[A-Za-z_][\w.]*Error:)|"
+        r"\bEngineCore\s+pid=\d+.*\b(?:Traceback|[A-Za-z_][\w.]*Error:))",
+        re.IGNORECASE,
+    ),
+    "worker_failure": re.compile(
+        r"(?:\b(?:vLLM\s+)?(?:worker|WorkerProc|RayWorkerWrapper|TP\s+worker|DP\s+worker|"
+        r"Ray\s+worker)\b.*(?:failed|fatal|error|exception|traceback|exited)|"
+        r"(?:worker|rank\s*\d+).*\b(?:fatal|failed|crashed)\b)",
+        re.IGNORECASE,
+    ),
+    "api_server_failure": re.compile(
+        r"(?:\bAPIServer\b.*(?:traceback|failed|fatal|error|exception|exited)|"
+        r"\b(?:API|HTTP)\s+server\b.*(?:failed|fatal|error|exception|exited)|"
+        r"Server\s+exited\s+unexpectedly|"
+        r"server\s+subprocess.*(?:failed|exited)|"
+        r"(?:api|http)\s+server.*\b(?:died|death)\b)",
+        re.IGNORECASE,
+    ),
+    "signal_or_process_exit": re.compile(
+        r"(?:\bSIG(?:ABRT|SEGV|KILL)\b|"
+        r"\bsignal\s+\d+\b|"
+        r"\bProcessExitedException\b|"
+        r"\b(?:child|subprocess|process)\b.*(?:exit(?:ed)?|terminated|killed)"
+        r"(?:\s+with)?\s+(?:code|status|signal)?\s*\d+)",
+        re.IGNORECASE,
+    ),
+    "cuda_nccl_or_oom": re.compile(
+        r"(?:\bCUDA\b|\bNCCL\b|\b(?:OutOfMemoryError|CUDAOutOfMemoryError)\b|"
+        r"out\s+of\s+memory|"
+        r"free\s+memory\s+on\s+device\s+cuda:\d+.*less\s+than\s+desired|"
+        r"GPU.*(?:memory|OOM)|"
+        r"(?:watchdog|peer)\s+failure)",
+        re.IGNORECASE,
+    ),
+    "import_or_linker_failure": re.compile(
+        r"(?:\b(?:ImportError|ModuleNotFoundError)\b|"
+        r"undefined\s+symbol|"
+        r"cannot\s+open\s+shared\s+object\s+file|"
+        r"no\s+such\s+file\s+or\s+directory.*\.so)",
+        re.IGNORECASE,
+    ),
+    "command_failure": re.compile(
+        r"(?:\b(?:The\s+)?command\s+(?:exited|failed)\s+with\s+(?:status|code)\s+\d+|"
+        r"\buser\s+command\s+error\b|"
+        r"\bplugin\b.*\b(?:command|hook)\b.*\b(?:exited|failed)\s+with\s+(?:status|code)\s+\d+)",
+        re.IGNORECASE,
+    ),
+    "python_traceback": re.compile(r"Traceback\s+\(most\s+recent\s+call\s+last\):"),
+}
+
+_PROCESS_RE = re.compile(
+    r"\(([^()\n]*\bpid=\d+)[^()\n]*\)|\b(Process\s+[A-Za-z][\w.-]*(?:\s+pid=\d+)?)\b"
+)
+_TEST_OR_COMMAND_MARKER_RE = re.compile(
+    r"(?:\+\+\+.*(?:Command|pytest)|"
+    r"(?:FAILED|ERROR|PASSED)\s+\S+|"
+    r"(?:^|\s)(?:pytest|python|uv|docker)\s+\S+)",
+    re.IGNORECASE,
+)
+
+
 def get_test_signature(failed_test: "FailedTest") -> tuple[str, str]:
     """Build the diff key for a failing test.
 
@@ -108,6 +212,178 @@ def strip_markers(text: str) -> str:
     ansi_regex = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
     osc_regex = re.compile(r"\x1b[\]_][^\x07]*\x07")
     return osc_regex.sub("", ansi_regex.sub("", text))
+
+
+def clean_failure_context_lines(text: str) -> list[str]:
+    """Return display lines with only transport/presentation noise removed."""
+    return [TIMESTAMP_RE.sub("", line) for line in strip_markers(text).splitlines()]
+
+
+_FAILURE_ANCHOR_PRECEDENCE = (
+    "engine_core_failure",
+    "worker_failure",
+    "api_server_failure",
+    "signal_or_process_exit",
+    "cuda_nccl_or_oom",
+    "import_or_linker_failure",
+    "command_failure",
+    "python_traceback",
+)
+
+
+def _classify_failure_anchor(line: str) -> str | None:
+    for window_type in _FAILURE_ANCHOR_PRECEDENCE:
+        if _FAILURE_ANCHOR_PATTERNS[window_type].search(line):
+            return window_type
+    return None
+
+
+def _nearest_match(
+    lines: list[str],
+    anchor_index: int,
+    start_index: int,
+    end_index: int,
+    pattern: re.Pattern[str],
+) -> str:
+    candidates = []
+    for index in range(start_index, end_index):
+        match = pattern.search(lines[index])
+        if match:
+            value = next((group for group in match.groups() if group), "")
+            candidates.append((abs(index - anchor_index), value.strip()))
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1] if candidates else ""
+
+
+def _failure_window_instance(
+    lines: list[str],
+    window_type: str,
+    anchor_index: int,
+    config: FailureContextConfig,
+) -> dict[str, Any]:
+    start_index = max(0, anchor_index - config.failure_window_context_before_lines)
+    end_index = min(
+        len(lines), anchor_index + config.failure_window_context_after_lines + 1
+    )
+    return {
+        "window_type": window_type,
+        "anchor_line": anchor_index + 1,
+        "start_line": start_index + 1,
+        "end_line": end_index,
+        "process": _nearest_match(
+            lines, anchor_index, start_index, end_index, _PROCESS_RE
+        ),
+        "nearest_marker": _nearest_match(
+            lines,
+            anchor_index,
+            start_index,
+            end_index,
+            _TEST_OR_COMMAND_MARKER_RE,
+        ),
+        "text": "\n".join(lines[start_index:end_index]),
+    }
+
+
+def extract_failure_context(
+    text: str,
+    config: FailureContextConfig | None = None,
+    *,
+    max_failure_window_instances_per_type: int | None = None,
+    raw_tail_line_count: int | None = None,
+    failure_window_context_before_lines: int | None = None,
+    failure_window_context_after_lines: int | None = None,
+) -> dict[str, Any]:
+    """Extract bounded, structured failure context from a complete Buildkite log.
+
+    The complete cleaned log is scanned for classified anchor lines, but only the
+    first configured number of windows per type is retained. The returned object is
+    JSON-serializable and contains the complete match counts so callers can see when
+    sampling truncated a noisy failure. Window intervals are intentionally not merged
+    here; that is a separate refinement from this first bounded implementation.
+    """
+    if config is not None and any(
+        value is not None
+        for value in (
+            max_failure_window_instances_per_type,
+            raw_tail_line_count,
+            failure_window_context_before_lines,
+            failure_window_context_after_lines,
+        )
+    ):
+        raise ValueError("config cannot be combined with individual overrides")
+    if config is None:
+        config = FailureContextConfig(
+            max_failure_window_instances_per_type=(
+                max_failure_window_instances_per_type
+                if max_failure_window_instances_per_type is not None
+                else 3
+            ),
+            raw_tail_line_count=(
+                raw_tail_line_count if raw_tail_line_count is not None else 400
+            ),
+            failure_window_context_before_lines=(
+                failure_window_context_before_lines
+                if failure_window_context_before_lines is not None
+                else 12
+            ),
+            failure_window_context_after_lines=(
+                failure_window_context_after_lines
+                if failure_window_context_after_lines is not None
+                else 80
+            ),
+        )
+
+    lines = clean_failure_context_lines(text)
+    anchors: dict[str, list[int]] = {
+        window_type: [] for window_type in FAILURE_WINDOW_TYPES
+    }
+    for line_index, line in enumerate(lines):
+        window_type = _classify_failure_anchor(line)
+        if window_type is not None:
+            anchors[window_type].append(line_index)
+
+    failure_windows = []
+    emitted_windows = []
+    for window_type in FAILURE_WINDOW_TYPES:
+        matches = anchors[window_type]
+        selected = matches[: config.max_failure_window_instances_per_type]
+        instances = [
+            _failure_window_instance(lines, window_type, index, config)
+            for index in selected
+        ]
+        failure_windows.append(
+            {
+                "window_type": window_type,
+                "matched_instance_count": len(matches),
+                "emitted_instance_count": len(instances),
+                "instances_truncated": len(matches) > len(instances),
+                "instances": instances,
+            }
+        )
+        emitted_windows.extend(instances)
+
+    emitted_windows.sort(key=lambda instance: instance["anchor_line"])
+    tail_count = min(config.raw_tail_line_count, len(lines))
+    if tail_count:
+        tail_start_line = len(lines) - tail_count + 1
+        raw_tail = "\n".join(lines[-tail_count:])
+    else:
+        tail_start_line = 0
+        raw_tail = ""
+    return {
+        "line_count": len(lines),
+        "failure_window_context_before_lines": config.failure_window_context_before_lines,
+        "failure_window_context_after_lines": config.failure_window_context_after_lines,
+        "max_failure_window_instances_per_type": config.max_failure_window_instances_per_type,
+        "failure_windows": failure_windows,
+        "windows_in_chronological_order": emitted_windows,
+        "raw_tail": {
+            "start_line": tail_start_line,
+            "end_line": len(lines) if tail_count else 0,
+            "line_count": tail_count,
+            "text": raw_tail,
+        },
+    }
 
 
 def parse_log(text: str) -> ParsedLog:

@@ -4,10 +4,17 @@ Log fixtures are tails (~100 lines) from real Buildkite job logs.
 raw_log_snippet.bin has ANSI + BKT markers for strip testing.
 """
 
+import json
 import unittest
 from pathlib import Path
 
-from torchci.vllm_log_parser import get_test_signature, parse_log, strip_markers
+from torchci.vllm_log_parser import (
+    FailureContextConfig,
+    extract_failure_context,
+    get_test_signature,
+    parse_log,
+    strip_markers,
+)
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -906,6 +913,76 @@ class TestGetTestSignature(unittest.TestCase):
         log = "FAILED tests/test_a.py::test_one\n= 1 failed in 1.00s ="
         failure = parse_log(log).pytest_results[0].test_failures[0]
         self.assertEqual(get_test_signature(failure), ("tests/test_a.py::test_one", ""))
+
+
+class TestFailureContext(unittest.TestCase):
+    def _summary(self, context, window_type):
+        return next(
+            item
+            for item in context["failure_windows"]
+            if item["window_type"] == window_type
+        )
+
+    def test_engine_window_keeps_early_cause_and_raw_tail(self) -> None:
+        lines = [f"noise-{index}" for index in range(1427)]
+        lines[321] = (
+            "[2026-07-13T19:32:43Z] (EngineCore pid=1289) ERROR "
+            "ValueError: Free memory on device cuda:0 (13.05/16.0 GiB) "
+            "on startup is less than desired GPU memory utilization (0.92, 14.72 GiB)."
+        )
+        lines[1426] = "tail-final-marker"
+        context = extract_failure_context("\n".join(lines))
+
+        engine = self._summary(context, "engine_core_failure")
+        self.assertEqual(engine["instances"][0]["anchor_line"], 322)
+        self.assertEqual(engine["instances"][0]["process"], "EngineCore pid=1289")
+        self.assertIn("13.05/16.0 GiB", engine["instances"][0]["text"])
+        self.assertIn("tail-final-marker", context["raw_tail"]["text"])
+        self.assertEqual(context["raw_tail"]["start_line"], 1028)
+        self.assertNotIn("noise-0", context["raw_tail"]["text"])
+        json.dumps(context)
+
+    def test_instance_limit_counts_all_matches(self) -> None:
+        body = "\n".join(
+            f"(EngineCore pid={index}) EngineCore failed to start" for index in range(4)
+        )
+        context = extract_failure_context(body, raw_tail_line_count=1)
+        engine = self._summary(context, "engine_core_failure")
+        self.assertEqual(engine["matched_instance_count"], 4)
+        self.assertEqual(engine["emitted_instance_count"], 3)
+        self.assertTrue(engine["instances_truncated"])
+
+    def test_each_window_type_has_its_own_limit(self) -> None:
+        body = "\n".join(
+            [
+                "(EngineCore pid=1) EngineCore failed to start",
+                "(EngineCore pid=2) EngineCore failed to start",
+                "(EngineCore pid=3) EngineCore failed to start",
+                "(EngineCore pid=4) EngineCore failed to start",
+                "CUDA error: out of memory",
+                "CUDA error: NCCL watchdog failure",
+                "CUDA error: peer failure",
+                "CUDA error: out of memory",
+            ]
+        )
+        context = extract_failure_context(body)
+        self.assertEqual(
+            self._summary(context, "engine_core_failure")["emitted_instance_count"], 3
+        )
+        self.assertEqual(
+            self._summary(context, "cuda_nccl_or_oom")["emitted_instance_count"], 3
+        )
+
+    def test_no_anchor_still_returns_default_tail(self) -> None:
+        context = extract_failure_context("one\ntwo\nthree")
+        self.assertEqual(context["windows_in_chronological_order"], [])
+        self.assertEqual(context["raw_tail"]["line_count"], 3)
+        self.assertEqual(context["raw_tail"]["text"], "one\ntwo\nthree")
+
+    def test_config_has_descriptive_default_limit(self) -> None:
+        self.assertEqual(
+            FailureContextConfig().max_failure_window_instances_per_type, 3
+        )
 
 
 if __name__ == "__main__":
