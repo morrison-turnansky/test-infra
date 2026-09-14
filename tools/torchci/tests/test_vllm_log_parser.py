@@ -979,6 +979,127 @@ class TestFailureContext(unittest.TestCase):
         self.assertEqual(context["raw_tail"]["line_count"], 3)
         self.assertEqual(context["raw_tail"]["text"], "one\ntwo\nthree")
 
+    def test_overlapping_intervals_render_shared_lines_once(self) -> None:
+        body = "\n".join(
+            [
+                "before",
+                "(EngineCore pid=1) EngineCore failed to start",
+                "shared traceback line",
+                "CUDA error: out of memory",
+                "after",
+            ]
+        )
+        context = extract_failure_context(
+            body,
+            failure_window_context_before_lines=1,
+            failure_window_context_after_lines=1,
+        )
+
+        self.assertEqual(context["rendered_interval_count"], 1)
+        [interval] = context["windows_in_chronological_order"]
+        self.assertEqual(interval["start_line"], 1)
+        self.assertEqual(interval["end_line"], 5)
+        self.assertEqual(interval["text"].count("shared traceback line"), 1)
+        self.assertEqual(
+            interval["window_types"],
+            [
+                "engine_core_failure",
+                "cuda_nccl_or_oom",
+            ],
+        )
+
+    def test_adjacent_intervals_merge(self) -> None:
+        body = "\n".join(
+            [
+                "(EngineCore pid=1) EngineCore failed to start",
+                "CUDA error: out of memory",
+            ]
+        )
+        context = extract_failure_context(
+            body,
+            failure_window_context_before_lines=0,
+            failure_window_context_after_lines=0,
+        )
+
+        self.assertEqual(context["rendered_interval_count"], 1)
+        [interval] = context["windows_in_chronological_order"]
+        self.assertEqual(interval["start_line"], 1)
+        self.assertEqual(interval["end_line"], 2)
+
+    def test_merged_interval_retains_types_and_anchor_metadata(self) -> None:
+        body = "\n".join(
+            [
+                "(EngineCore pid=1289) EngineCore failed to start",
+                "CUDA error: out of memory",
+            ]
+        )
+        context = extract_failure_context(
+            body,
+            failure_window_context_before_lines=0,
+            failure_window_context_after_lines=0,
+        )
+        [interval] = context["windows_in_chronological_order"]
+
+        self.assertEqual(
+            interval["window_types"],
+            [
+                "engine_core_failure",
+                "cuda_nccl_or_oom",
+            ],
+        )
+        self.assertEqual(interval["anchor_lines"], [1, 2])
+        self.assertEqual(
+            [
+                (anchor["window_type"], anchor["anchor_line"])
+                for anchor in interval["anchors"]
+            ],
+            [("engine_core_failure", 1), ("cuda_nccl_or_oom", 2)],
+        )
+
+    def test_disjoint_identical_occurrences_remain_distinct(self) -> None:
+        body = "\n".join(
+            [
+                "(EngineCore pid=1) EngineCore failed to start",
+                "separator",
+                "(EngineCore pid=1) EngineCore failed to start",
+            ]
+        )
+        context = extract_failure_context(
+            body,
+            failure_window_context_before_lines=0,
+            failure_window_context_after_lines=0,
+        )
+
+        self.assertEqual(context["rendered_interval_count"], 2)
+        self.assertEqual(
+            [
+                interval["anchor_lines"]
+                for interval in context["windows_in_chronological_order"]
+            ],
+            [[1], [3]],
+        )
+        self.assertEqual(
+            self._summary(context, "engine_core_failure")["emitted_instance_count"],
+            2,
+        )
+
+    def test_counts_remain_premerge_counts(self) -> None:
+        body = "\n".join(
+            f"(EngineCore pid={index}) EngineCore failed to start" for index in range(4)
+        )
+        context = extract_failure_context(
+            body,
+            failure_window_context_before_lines=0,
+            failure_window_context_after_lines=0,
+        )
+        engine = self._summary(context, "engine_core_failure")
+
+        self.assertEqual(engine["matched_instance_count"], 4)
+        self.assertEqual(engine["emitted_instance_count"], 3)
+        self.assertTrue(engine["instances_truncated"])
+        self.assertEqual(engine["rendered_interval_count"], 1)
+        self.assertEqual(context["rendered_interval_count"], 1)
+
     def test_config_has_descriptive_default_limit(self) -> None:
         self.assertEqual(
             FailureContextConfig().max_failure_window_instances_per_type, 3

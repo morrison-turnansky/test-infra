@@ -605,24 +605,37 @@ def render_failure_context(
         sections.append(
             f"#   {summary['window_type']}: matched={summary['matched_instance_count']} "
             f"emitted={summary['emitted_instance_count']} "
-            f"truncated={summary['instances_truncated']}"
+            f"truncated={summary['instances_truncated']} "
+            f"rendered_intervals={summary['rendered_interval_count']}"
         )
+    sections.append(
+        f"# rendered_failure_intervals: {context['rendered_interval_count']}"
+    )
     sections.append("")
 
-    # Instances are serialized in chronological order. The per-type counts above
-    # retain observability without grouping the displayed windows by type.
+    # Merged intervals are serialized in chronological order. The per-type counts
+    # above retain pre-merge observability, while each interval retains every
+    # contributing type and anchor.
     for instance_number, instance in enumerate(
         context["windows_in_chronological_order"], start=1
     ):
+        window_types = instance.get("window_types", [instance["window_type"]])
+        anchor_lines = instance.get("anchor_lines", [instance["anchor_line"]])
         sections.append(
-            f"## failure_window {instance_number}: {instance['window_type']} "
+            f"## failure_window {instance_number}: {' + '.join(window_types)} "
             f"(lines {instance['start_line']}-{instance['end_line']}, "
-            f"anchor {instance['anchor_line']})"
+            f"anchors {', '.join(str(line) for line in anchor_lines)})"
         )
-        if instance["process"]:
-            sections.append(f"# process: {instance['process']}")
-        if instance["nearest_marker"]:
-            sections.append(f"# nearest_marker: {instance['nearest_marker']}")
+        for anchor in instance.get("anchors", []):
+            details = [
+                f"type={anchor['window_type']}",
+                f"line={anchor['anchor_line']}",
+            ]
+            if anchor["process"]:
+                details.append(f"process={anchor['process']}")
+            if anchor["nearest_marker"]:
+                details.append(f"nearest_marker={anchor['nearest_marker']}")
+            sections.append(f"# contributing_anchor: {'; '.join(details)}")
         sections.append("")
         sections.append(instance["text"])
         sections.append("")

@@ -284,6 +284,93 @@ def _failure_window_instance(
     }
 
 
+def _merge_failure_window_intervals(
+    lines: list[str], instances: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge selected failure-window intervals in chronological order.
+
+    The instances have already been sampled independently for each window type.
+    Merging happens only after that sampling, so the per-type matched/emitted
+    counts remain counts of the original occurrences rather than counts of the
+    rendered intervals.  A one-line gap is not allowed: directly adjacent
+    intervals have ``next.start_line == current.end_line + 1`` and are merged.
+    """
+    ordered = sorted(
+        instances,
+        key=lambda instance: (
+            instance["start_line"],
+            instance["end_line"],
+            instance["anchor_line"],
+            instance["window_type"],
+        ),
+    )
+    merged: list[dict[str, Any]] = []
+
+    for instance in ordered:
+        if not merged or instance["start_line"] > merged[-1]["end_line"] + 1:
+            merged.append(
+                {
+                    "window_type": instance["window_type"],
+                    "window_types": [instance["window_type"]],
+                    # Keep the singular fields for compatibility with the
+                    # Phase 1 shape.  ``anchor_lines`` and ``anchors`` retain
+                    # every occurrence when an interval contains more than one.
+                    "anchor_line": instance["anchor_line"],
+                    "anchor_lines": [instance["anchor_line"]],
+                    "start_line": instance["start_line"],
+                    "end_line": instance["end_line"],
+                    "process": instance["process"],
+                    "processes": ([instance["process"]] if instance["process"] else []),
+                    "nearest_marker": instance["nearest_marker"],
+                    "nearest_markers": (
+                        [instance["nearest_marker"]]
+                        if instance["nearest_marker"]
+                        else []
+                    ),
+                    "anchors": [
+                        {
+                            "window_type": instance["window_type"],
+                            "anchor_line": instance["anchor_line"],
+                            "process": instance["process"],
+                            "nearest_marker": instance["nearest_marker"],
+                        }
+                    ],
+                    "text": "\n".join(
+                        lines[instance["start_line"] - 1 : instance["end_line"]]
+                    ),
+                }
+            )
+            continue
+
+        current = merged[-1]
+        current["end_line"] = max(current["end_line"], instance["end_line"])
+        if instance["window_type"] not in current["window_types"]:
+            current["window_types"].append(instance["window_type"])
+        current["anchor_lines"].append(instance["anchor_line"])
+        current["anchors"].append(
+            {
+                "window_type": instance["window_type"],
+                "anchor_line": instance["anchor_line"],
+                "process": instance["process"],
+                "nearest_marker": instance["nearest_marker"],
+            }
+        )
+        if instance["process"]:
+            current["processes"].append(instance["process"])
+        if instance["nearest_marker"]:
+            current["nearest_markers"].append(instance["nearest_marker"])
+        current["window_type"] = (
+            current["window_types"][0]
+            if len(current["window_types"]) == 1
+            else "merged"
+        )
+        current["text"] = "\n".join(
+            lines[current["start_line"] - 1 : current["end_line"]]
+        )
+
+    return merged
+
+
 def extract_failure_context(
     text: str,
     config: FailureContextConfig | None = None,
@@ -296,10 +383,11 @@ def extract_failure_context(
     """Extract bounded, structured failure context from a complete Buildkite log.
 
     The complete cleaned log is scanned for classified anchor lines, but only the
-    first configured number of windows per type is retained. The returned object is
-    JSON-serializable and contains the complete match counts so callers can see when
-    sampling truncated a noisy failure. Window intervals are intentionally not merged
-    here; that is a separate refinement from this first bounded implementation.
+    first configured number of windows per type is retained. The selected intervals
+    are then sorted and merged when they overlap or are directly adjacent. The
+    returned object is JSON-serializable and contains the complete match counts so
+    callers can see when sampling truncated a noisy failure, as well as the number
+    of post-merge intervals rendered below those counts.
     """
     if config is not None and any(
         value is not None
@@ -343,7 +431,7 @@ def extract_failure_context(
             anchors[window_type].append(line_index)
 
     failure_windows = []
-    emitted_windows = []
+    selected_windows: list[dict[str, Any]] = []
     for window_type in FAILURE_WINDOW_TYPES:
         matches = anchors[window_type]
         selected = matches[: config.max_failure_window_instances_per_type]
@@ -351,6 +439,7 @@ def extract_failure_context(
             _failure_window_instance(lines, window_type, index, config)
             for index in selected
         ]
+        selected_windows.extend(instances)
         failure_windows.append(
             {
                 "window_type": window_type,
@@ -360,9 +449,13 @@ def extract_failure_context(
                 "instances": instances,
             }
         )
-        emitted_windows.extend(instances)
 
-    emitted_windows.sort(key=lambda instance: instance["anchor_line"])
+    rendered_windows = _merge_failure_window_intervals(lines, selected_windows)
+    for summary in failure_windows:
+        summary["rendered_interval_count"] = sum(
+            summary["window_type"] in interval["window_types"]
+            for interval in rendered_windows
+        )
     tail_count = min(config.raw_tail_line_count, len(lines))
     if tail_count:
         tail_start_line = len(lines) - tail_count + 1
@@ -376,7 +469,8 @@ def extract_failure_context(
         "failure_window_context_after_lines": config.failure_window_context_after_lines,
         "max_failure_window_instances_per_type": config.max_failure_window_instances_per_type,
         "failure_windows": failure_windows,
-        "windows_in_chronological_order": emitted_windows,
+        "rendered_interval_count": len(rendered_windows),
+        "windows_in_chronological_order": rendered_windows,
         "raw_tail": {
             "start_line": tail_start_line,
             "end_line": len(lines) if tail_count else 0,
